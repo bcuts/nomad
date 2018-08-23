@@ -1,4 +1,4 @@
-package allocrunner
+package allocwatcher
 
 import (
 	"archive/tar"
