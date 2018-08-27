@@ -109,7 +109,7 @@ func TestResourceDistance(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run("", func(t *testing.T) {
 			require := require.New(t)
-			require.Equal(tc.expectedDistance, fmt.Sprintf("%3.3f", ResourceDistance(tc.allocResource, resourceAsk)))
+			require.Equal(tc.expectedDistance, fmt.Sprintf("%3.3f", resourceDistance(tc.allocResource, resourceAsk)))
 		})
 
 	}

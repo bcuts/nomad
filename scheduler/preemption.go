@@ -8,10 +8,10 @@ import (
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
-// ResourceDistance returns how close the resource is to the resource being asked for
+// resourceDistance returns how close the resource is to the resource being asked for
 // It is calculated by first computing a relative fraction and then measuring how close
 // that is to zero. Lower values are closer
-func ResourceDistance(resource *structs.Resources, resourceAsk *structs.Resources) float64 {
+func resourceDistance(resource *structs.Resources, resourceAsk *structs.Resources) float64 {
 	memoryCoord, cpuCoord, iopsCoord, diskMBCoord, mbitsCoord := 0.0, 0.0, 0.0, 0.0, 0.0
 	if resourceAsk.MemoryMB > 0 {
 		memoryCoord = float64(resourceAsk.MemoryMB-resource.MemoryMB) / float64(resourceAsk.MemoryMB)
@@ -40,84 +40,83 @@ func ResourceDistance(resource *structs.Resources, resourceAsk *structs.Resource
 	return originDist
 }
 
-// GetPreemptibleAllocs computes a list of allocations to preempt to accomodate
+// GetPreemptibleAllocs computes a list of allocations to preempt to accommodate
 // the resource asked for. Only allocs with a job priority < 10 of jobPriority are considered
 // This currently does not account for static port asks
 func GetPreemptibleAllocs(jobPriority int, current []*structs.Allocation, resourceAsk *structs.Resources) []*structs.Allocation {
-	// Sort by priority first
-	sort.Slice(current, func(i, j int) bool {
-		return current[i].Job.Priority < current[j].Job.Priority
-	})
+
+	groupedAllocs := filterAndGroupPreemptibleAllocs(jobPriority, current)
 
 	var bestAllocs []*structs.Allocation
 	requirementsMet := false
 	var preemptedResources *structs.Resources
-
-	i := 0
-	for len(current) > 0 && !requirementsMet {
-		closestAllocIndex := -1
-		bestDistance := math.MaxFloat64
-		for index, alloc := range current {
-			// Skip ineligible allocs
-			if alloc.Job.Priority >= jobPriority+10 {
-				continue
+	for _, allocGrp := range groupedAllocs {
+		for len(allocGrp.allocs) > 0 && !requirementsMet {
+			closestAllocIndex := -1
+			bestDistance := math.MaxFloat64
+			// find the alloc with the closest distance
+			for index, alloc := range allocGrp.allocs {
+				distance := resourceDistance(alloc.Resources, resourceAsk)
+				fmt.Printf("%+v, %3.3f\n", alloc.Resources, distance)
+				if distance < bestDistance {
+					bestDistance = distance
+					closestAllocIndex = index
+				}
 			}
-			distance := ResourceDistance(alloc.Resources, resourceAsk)
-			fmt.Printf("%+v, %3.3f\n", alloc.Resources, distance)
-			if distance < bestDistance {
-				bestDistance = distance
-				closestAllocIndex = index
-			}
-		}
-		if closestAllocIndex == -1 {
-			// This means no option in the current list was eligible for preemption
-			// Can stop looking
-			break
-		}
-		closestAlloc := current[closestAllocIndex]
-		if preemptedResources == nil {
-			preemptedResources = closestAlloc.Resources.Copy()
-		} else {
-			preemptedResources.Add(closestAlloc.Resources)
-		}
-		requirementsMet = MeetsRequirements(preemptedResources, resourceAsk)
-		fmt.Printf("requirements met after iteration %v %v \n", i, requirementsMet)
-		i++
-		bestAllocs = append(bestAllocs, closestAlloc)
-		current[closestAllocIndex] = current[len(current)-1]
-		current = current[:len(current)-1]
-	}
-
-	if requirementsMet {
-		// We do another pass to eliminate unnecessary preemptions
-		// This filters out allocs whose resources are already covered by another alloc
-
-		// Sort by distance reversed to surface any superset allocs first
-		sort.Slice(bestAllocs, func(i, j int) bool {
-			distance1 := ResourceDistance(bestAllocs[i].Resources, resourceAsk)
-			distance2 := ResourceDistance(bestAllocs[j].Resources, resourceAsk)
-			return distance1 > distance2
-		})
-
-		var filteredBestAllocs []*structs.Allocation
-		// Reset aggregate preempted resources so that we can do another pass
-		preemptedResources = nil
-		for _, alloc := range bestAllocs {
-			if preemptedResources == nil {
-				preemptedResources = alloc.Resources
-			} else {
-				preemptedResources.Add(alloc.Resources)
-			}
-			filteredBestAllocs = append(filteredBestAllocs, alloc)
-			requirementsMet := MeetsRequirements(preemptedResources, resourceAsk)
-			if requirementsMet {
+			if closestAllocIndex == -1 {
+				// This means no option in the current list was eligible for preemption
+				// Can stop looking
 				break
 			}
+			closestAlloc := allocGrp.allocs[closestAllocIndex]
+			if preemptedResources == nil {
+				preemptedResources = closestAlloc.Resources.Copy()
+			} else {
+				preemptedResources.Add(closestAlloc.Resources)
+			}
+			requirementsMet = MeetsRequirements(preemptedResources, resourceAsk)
+			bestAllocs = append(bestAllocs, closestAlloc)
+			allocGrp.allocs[closestAllocIndex] = allocGrp.allocs[len(allocGrp.allocs)-1]
+			allocGrp.allocs = allocGrp.allocs[:len(allocGrp.allocs)-1]
 		}
-
-		return filteredBestAllocs
+		if requirementsMet {
+			break
+		}
 	}
-	return nil
+
+	// Early return if all allocs examined and requirements were not met
+	if !requirementsMet {
+		return nil
+	}
+
+	// We do another pass to eliminate unnecessary preemptions
+	// This filters out allocs whose resources are already covered by another alloc
+
+	// Sort by distance reversed to surface any superset allocs first
+	sort.Slice(bestAllocs, func(i, j int) bool {
+		distance1 := resourceDistance(bestAllocs[i].Resources, resourceAsk)
+		distance2 := resourceDistance(bestAllocs[j].Resources, resourceAsk)
+		return distance1 > distance2
+	})
+
+	var filteredBestAllocs []*structs.Allocation
+	// Reset aggregate preempted resources so that we can do another pass
+	preemptedResources = nil
+	for _, alloc := range bestAllocs {
+		if preemptedResources == nil {
+			preemptedResources = alloc.Resources
+		} else {
+			preemptedResources.Add(alloc.Resources)
+		}
+		filteredBestAllocs = append(filteredBestAllocs, alloc)
+		requirementsMet := MeetsRequirements(preemptedResources, resourceAsk)
+		if requirementsMet {
+			break
+		}
+	}
+
+	return filteredBestAllocs
+
 }
 
 // MeetsRequirements checks if the first resource meets or exceeds the second resource's requirements
@@ -141,4 +140,39 @@ func MeetsRequirements(first *structs.Resources, second *structs.Resources) bool
 		}
 	}
 	return true
+}
+
+type groupedAllocs struct {
+	priority int
+	allocs   []*structs.Allocation
+}
+
+func filterAndGroupPreemptibleAllocs(jobPriority int, current []*structs.Allocation) []*groupedAllocs {
+	allocsByPriority := make(map[int][]*structs.Allocation)
+	for _, alloc := range current {
+		// Skip ineligible allocs
+		if alloc.Job.Priority >= jobPriority+10 {
+			continue
+		}
+		grpAllocs, ok := allocsByPriority[alloc.Job.Priority]
+		if !ok {
+			grpAllocs = make([]*structs.Allocation, 0)
+		}
+		grpAllocs = append(grpAllocs, alloc)
+		allocsByPriority[alloc.Job.Priority] = grpAllocs
+	}
+
+	var groupedSortedAllocs []*groupedAllocs
+	for priority, allocs := range allocsByPriority {
+		groupedSortedAllocs = append(groupedSortedAllocs, &groupedAllocs{
+			priority: priority,
+			allocs:   allocs})
+	}
+
+	sort.Slice(groupedSortedAllocs, func(i, j int) bool {
+		return groupedSortedAllocs[i].priority < groupedSortedAllocs[j].priority
+	})
+
+	// Sort by priority
+	return groupedSortedAllocs
 }
